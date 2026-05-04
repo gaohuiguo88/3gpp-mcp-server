@@ -9,6 +9,9 @@
 
 import axios, { AxiosInstance } from 'axios';
 import NodeCache from 'node-cache';
+import fs from 'fs';
+import path from 'path';
+import MiniSearch from 'minisearch';
 
 export interface TSpecSearchRequest {
   query: string;
@@ -43,9 +46,13 @@ export class TSpecLLMClient {
   private api: AxiosInstance;
   private cache: NodeCache;
   private baseUrl: string;
+  private dataDir: string;
+  private searchIndex: MiniSearch | null = null;
+  private documents: Map<string, { specId: string; release: string; content: string; title: string }> = new Map();
 
-  constructor(huggingFaceToken?: string) {
+  constructor(dataDir?: string, huggingFaceToken?: string) {
     this.baseUrl = 'https://api-inference.huggingface.co/datasets/rasoul-nikbakht/TSpec-LLM';
+    this.dataDir = dataDir || path.join(process.cwd(), 'data', 'tspec-llm');
 
     this.api = axios.create({
       baseURL: this.baseUrl,
@@ -62,6 +69,113 @@ export class TSpecLLMClient {
       maxKeys: 1000,
       useClones: false
     });
+  }
+
+  /**
+   * Load markdown files from the local TSpec-LLM dataset directory
+   */
+  private loadDocuments(): void {
+    if (this.documents.size > 0) return;
+
+    if (!fs.existsSync(this.dataDir)) {
+      console.warn(`TSpec-LLM data directory not found: ${this.dataDir}`);
+      return;
+    }
+
+    const files: string[] = [];
+
+    // Recursively find all .md files
+    const walkDir = (dir: string) => {
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          const fullPath = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            walkDir(fullPath);
+          } else if (entry.name.endsWith('.md') || entry.name.endsWith('.mdx')) {
+            files.push(fullPath);
+          }
+        }
+      } catch (err) {
+        console.warn(`Cannot read directory ${dir}:`, err);
+      }
+    };
+
+    walkDir(this.dataDir);
+
+    for (const filePath of files) {
+      try {
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const relativePath = path.relative(this.dataDir, filePath);
+        // Extract spec ID from filename or parent directory
+        const specId = this.extractSpecId(filePath, relativePath);
+        const release = this.guessRelease(content);
+        const title = this.extractTitle(content);
+
+        const docId = relativePath.replace(/\\/g, '/');
+        this.documents.set(docId, { specId, release, content, title });
+      } catch (err) {
+        console.warn(`Cannot read ${filePath}:`, err);
+      }
+    }
+
+    console.log(`Loaded ${this.documents.size} TSpec-LLM documents from ${this.dataDir}`);
+  }
+
+  /**
+   * Build full-text search index (call after loadDocuments)
+   */
+  private ensureIndex(): MiniSearch {
+    if (this.searchIndex) return this.searchIndex;
+
+    this.loadDocuments();
+
+    this.searchIndex = new MiniSearch({
+      fields: ['content', 'title', 'specId'],
+      storeFields: ['specId', 'title', 'release'],
+      searchOptions: {
+        boost: { title: 3, specId: 5, content: 1 },
+        fuzzy: 0.2,
+        prefix: true
+      }
+    });
+
+    const docs = Array.from(this.documents.entries()).map(([id, doc]) => ({
+      id,
+      content: doc.content.slice(0, 50000), // limit per doc to avoid OOM
+      title: doc.title,
+      specId: doc.specId,
+      release: doc.release
+    }));
+
+    if (docs.length > 0) {
+      this.searchIndex.addAll(docs);
+    }
+
+    return this.searchIndex;
+  }
+
+  private extractSpecId(filePath: string, relativePath: string): string {
+    // Try to extract spec ID from filename like "TS_32.290.md" or "32290.md"
+    const fileName = path.basename(filePath);
+    const match = fileName.match(/(?:TS[_\s]?)?(\d{2,3}[._]\d{3,4})/i);
+    if (match) return `TS ${match[1].replace('_', '.')}`;
+    return relativePath;
+  }
+
+  private extractTitle(content: string): string {
+    const match = content.match(/^#\s+(.+)/m);
+    return match ? match[1].trim() : 'Untitled';
+  }
+
+  private guessRelease(content: string): string {
+    const match = content.match(/Rel(?:ease)?[\.\s-]*(\d{2,})/i);
+    if (match) {
+      const num = parseInt(match[1]);
+      if (num >= 15) return `Rel-${num}`;
+      if (num >= 8) return `Rel-${num}`;
+    }
+    return 'Unknown';
   }
 
   async searchSpecifications(request: TSpecSearchRequest): Promise<TSpecSearchResponse> {
@@ -95,444 +209,94 @@ export class TSpecLLMClient {
   }
 
   private async performTSpecSearch(request: TSpecSearchRequest): Promise<TSpecSearchResult[]> {
-    // This is a simplified implementation
-    // In production, this would integrate with the actual TSpec-LLM dataset API
-
     const query = request.query.toLowerCase();
     const maxResults = request.max_results || 10;
 
-    // Mock results based on query content
-    const mockResults: TSpecSearchResult[] = [];
+    // Try real local dataset search first
+    const index = this.ensureIndex();
+    if (this.documents.size > 0) {
+      const searchResults = index.search(query, { fuzzy: 0.2, prefix: true });
 
-    // Fuzzy matching for specification IDs
-    const fuzzyMatches = this.findFuzzySpecificationMatches(query);
-    if (fuzzyMatches.length > 0) {
-      fuzzyMatches.forEach(match => {
-        mockResults.push({
-          content: `Specification Match: ${match.specId}
+      let results: TSpecSearchResult[] = searchResults.slice(0, maxResults * 2).map(result => {
+        const doc = this.documents.get(result.id);
+        if (!doc) return null;
 
-Title: ${this.getSpecificationTitle(match.specId)}
-Working Group: ${this.getWorkingGroup(match.specId)}
-Summary: ${this.getSpecificationSummary(match.specId)}
+        // Extract the most relevant section from content
+        const section = this.findRelevantSection(doc.content, query);
 
-This specification was found through fuzzy matching with confidence score: ${match.confidence.toFixed(2)}
-
-For detailed information about this specification, please search using the exact specification ID: "${match.specId}"`,
-          source_specification: match.specId,
-          release: 'Rel-17',
-          section: 'Overview',
-          relevance_score: match.confidence,
+        return {
+          content: section,
+          source_specification: doc.specId,
+          release: doc.release,
+          section: result.id.replace(/\\/g, '/'),
+          relevance_score: result.score,
           metadata: {
-            specification_id: match.specId,
-            working_group: this.getWorkingGroup(match.specId),
+            specification_id: doc.specId,
+            working_group: this.guessWorkingGroup(doc.specId),
             document_type: 'Technical Specification',
-            keywords: ['fuzzy-match', 'specification-lookup', match.specId.toLowerCase().replace(/\s+/g, '-')]
+            keywords: query.split(/\s+/).filter(k => k.length > 2)
           }
-        });
-      });
+        } as TSpecSearchResult;
+      }).filter((r): r is TSpecSearchResult => r !== null);
+
+      // Apply filters
+      if (request.series_filter && request.series_filter.length > 0) {
+        results = results.filter(r =>
+          request.series_filter!.some(s => r.source_specification.startsWith(`TS ${s}`))
+        );
+      }
+      if (request.release_filter && request.release_filter.length > 0) {
+        results = results.filter(r => request.release_filter!.includes(r.release));
+      }
+
+      return results.slice(0, maxResults);
     }
 
-    if (query.includes('charging') || query.includes('chf') || query.includes('billing')) {
-      mockResults.push({
-        content: `The Charging Function (CHF) is a key component in the 5G charging architecture that provides converged online and offline charging services. The CHF supports service-based interfaces using HTTP/2 REST APIs as defined in TS 32.290.
+    // Fallback: no local dataset, send meaningful message
+    console.warn('TSpec-LLM dataset not found locally. Returning empty results.');
+    return [];
+  }
 
-Key capabilities of CHF include:
-- Converged charging session management
-- Service-based charging interface (Nchf)
-- Integration with Policy Control Function (PCF)
-- Support for multiple charging models (volume, time, event-based)
+  /**
+   * Find the most relevant paragraph/section from content for the query
+   */
+  private findRelevantSection(content: string, query: string): string {
+    const lines = content.split('\n');
+    let bestScore = 0;
+    let bestStart = 0;
+    const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
 
-Implementation requirements:
-- HTTP/2 protocol support
-- RESTful API compliance
-- JSON message formatting
-- OAuth 2.0 authentication`,
-        source_specification: 'TS 32.290',
-        release: 'Rel-17',
-        section: '6.1.2',
-        relevance_score: 0.95,
-        metadata: {
-          specification_id: 'TS 32.290',
-          working_group: 'SA5',
-          document_type: 'Technical Specification',
-          keywords: ['charging', 'chf', 'converged', '5g', 'service-based']
-        }
-      });
-
-      if (query.includes('implementation') || query.includes('requirements')) {
-        mockResults.push({
-          content: `CHF Implementation Requirements:
-
-Mandatory Features:
-1. HTTP/2 protocol stack with TLS 1.3
-2. RESTful API endpoints for charging services
-3. JSON message format support
-4. Service registration and discovery
-5. Load balancing and failover capabilities
-
-Optional Features:
-1. Performance monitoring and analytics
-2. Multi-tenancy support
-3. Geographical redundancy
-4. Advanced charging policies
-
-Technical Requirements:
-- Memory: Minimum 4GB RAM for production deployment
-- CPU: Multi-core processor for concurrent session handling
-- Storage: SSD recommended for session data persistence
-- Network: High-speed network connectivity for real-time charging`,
-          source_specification: 'TS 32.290',
-          release: 'Rel-17',
-          section: '8.2.1',
-          relevance_score: 0.92,
-          metadata: {
-            specification_id: 'TS 32.290',
-            working_group: 'SA5',
-            document_type: 'Technical Specification',
-            keywords: ['implementation', 'requirements', 'chf', 'technical']
-          }
-        });
+    // Score each line and take the best window
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].toLowerCase();
+      let score = 0;
+      for (const term of queryTerms) {
+        if (line.includes(term)) score++;
+      }
+      // Boost section headers
+      if (lines[i].startsWith('#')) score *= 1.5;
+      if (score > bestScore) {
+        bestScore = score;
+        bestStart = i;
       }
     }
 
-    if (query.includes('handover') || query.includes('mobility')) {
-      mockResults.push({
-        content: `5G Handover Procedures:
-
-The 5G handover procedure enables seamless mobility between gNBs while maintaining service continuity. Key procedures include:
-
-1. Measurement Configuration:
-   - Configure UE measurement parameters
-   - Set handover thresholds (A3 events)
-   - Define measurement gaps and reporting intervals
-
-2. Handover Preparation:
-   - Source gNB receives measurement reports
-   - Handover decision based on radio conditions
-   - HandoverRequest sent to target gNB
-   - Resource allocation at target
-
-3. Handover Execution:
-   - RRCReconfiguration sent to UE
-   - UE performs random access at target
-   - Data forwarding from source to target
-   - Path switch completion
-
-Timing Requirements:
-- Preparation phase: ≤50ms
-- Execution phase: ≤27ms for intra-frequency`,
-        source_specification: 'TS 38.331',
-        release: 'Rel-16',
-        section: '5.3.5',
-        relevance_score: 0.89,
-        metadata: {
-          specification_id: 'TS 38.331',
-          working_group: 'RAN2',
-          document_type: 'Technical Specification',
-          keywords: ['handover', 'mobility', '5g', 'rrc', 'procedures']
-        }
-      });
+    if (bestScore === 0) {
+      // Return beginning of document
+      return lines.slice(0, Math.min(50, lines.length)).join('\n');
     }
 
-    if (query.includes('authentication') || query.includes('security') || query.includes('5g-aka')) {
-      mockResults.push({
-        content: `5G-AKA Authentication Procedure:
+    // Return a window around the best matching section
+    const start = Math.max(0, bestStart - 3);
+    const end = Math.min(lines.length, bestStart + 30);
+    return lines.slice(start, end).join('\n');
+  }
 
-The 5G Authentication and Key Agreement (5G-AKA) protocol provides mutual authentication between UE and network:
-
-1. Authentication Initiation:
-   - UE sends Registration Request with SUCI
-   - AMF derives SUPI from SUCI using decryption
-   - AMF initiates authentication with AUSF
-
-2. Authentication Vector Generation:
-   - AUSF requests authentication vectors from UDM
-   - UDM generates RAND, AUTN, XRES*, Kausf
-   - Authentication vectors sent to AUSF
-
-3. Authentication Challenge:
-   - AMF sends Authentication Request (RAND, AUTN)
-   - UE verifies AUTN and computes RES*
-   - UE sends Authentication Response with RES*
-
-4. Authentication Verification:
-   - AMF forwards RES* to AUSF for verification
-   - AUSF confirms authentication success
-   - Security context established
-
-Security Features:
-- SUCI/SUPI privacy protection
-- Forward secrecy with 256-bit keys
-- Anti-bidding down protection`,
-        source_specification: 'TS 33.501',
-        release: 'Rel-16',
-        section: '6.1.3',
-        relevance_score: 0.94,
-        metadata: {
-          specification_id: 'TS 33.501',
-          working_group: 'SA3',
-          document_type: 'Technical Specification',
-          keywords: ['authentication', 'security', '5g-aka', 'ausf', 'keys']
-        }
-      });
-    }
-
-    if (query.includes('notifyid') || query.includes('29.594') || query.includes('event exposure') || query.includes('n28')) {
-      mockResults.push({
-        content: `TS 29.594 Event Exposure API - notifyID Field:
-
-The notifyID field in TS 29.594 serves as a unique identifier for event exposure notifications in the 5G Service Based Architecture:
-
-1. notifyID Field Definition:
-   - Type: string
-   - Format: UUID or vendor-specific identifier
-   - Purpose: Uniquely identifies a notification within the scope of the subscription
-   - Location: EventNotification data structure
-
-2. Usage in N28 Interface:
-   - Used in POST /events/{subscriptionId}/notify operations
-   - Enables correlation between notifications and subscriptions
-   - Supports duplicate detection and ordering
-   - Required field in EventNotification structure
-
-3. Implementation Requirements (Release 15):
-   - MUST be unique per subscription instance
-   - SHOULD follow UUID format (RFC 4122)
-   - MUST be included in all event notifications
-   - Used for notification acknowledgment and tracking
-
-4. Event Exposure Procedures:
-   - Subscription creation via POST /subscriptions
-   - Event notification via POST /events/{subscriptionId}/notify
-   - Subscription modification via PUT /subscriptions/{subscriptionId}
-   - Unsubscription via DELETE /subscriptions/{subscriptionId}
-
-5. N28 Interface Context:
-   - Interface between Network Functions and Network Exposure Function (NEF)
-   - Supports event monitoring and exposure to external applications
-   - Enables real-time event notifications with proper identification
-
-Data Structure Example:
-{
-  "notifyId": "123e4567-e89b-12d3-a456-426614174000",
-  "eventNotifs": [...],
-  "subscriptionId": "sub-001"
-}`,
-        source_specification: 'TS 29.594',
-        release: 'Rel-15',
-        section: '5.2.4',
-        relevance_score: 0.98,
-        metadata: {
-          specification_id: 'TS 29.594',
-          working_group: 'SA2',
-          document_type: 'Technical Specification',
-          keywords: ['notifyid', 'event-exposure', 'n28', 'notifications', 'api']
-        }
-      });
-
-      if (query.toLowerCase().includes('r15') || query.toLowerCase().includes('rel-15') || query.toLowerCase().includes('release 15')) {
-        mockResults.push({
-          content: `TS 29.594 Release 15 Specific Features:
-
-Release 15 introduces the foundational event exposure capabilities with notifyID field support:
-
-1. notifyID Field in Release 15:
-   - Initial specification of unique notification identifier
-   - Mandatory field for all event notifications
-   - Support for basic UUID format
-   - Foundation for subscription management
-
-2. N28 Interface Release 15 Capabilities:
-   - Basic event exposure between NFs and NEF
-   - Support for monitoring configuration events
-   - Location reporting event exposure
-   - Communication failure detection
-
-3. Release 15 Implementation Notes:
-   - notifyID format: UUID recommended but not mandatory
-   - Limited event types compared to later releases
-   - Basic subscription lifecycle management
-   - Foundation for 5G SA event exposure architecture
-
-4. API Operations in Release 15:
-   - POST /subscriptions (create event subscription)
-   - GET /subscriptions/{subscriptionId} (retrieve subscription)
-   - PUT /subscriptions/{subscriptionId} (modify subscription)
-   - DELETE /subscriptions/{subscriptionId} (cancel subscription)
-   - POST /events/{subscriptionId}/notify (event notification with notifyID)
-
-Backward Compatibility:
-- Release 15 notifyID implementation is forward compatible
-- Later releases enhance but maintain R15 basic functionality`,
-          source_specification: 'TS 29.594',
-          release: 'Rel-15',
-          section: '4.1.1',
-          relevance_score: 0.96,
-          metadata: {
-            specification_id: 'TS 29.594',
-            working_group: 'SA2',
-            document_type: 'Technical Specification',
-            keywords: ['notifyid', 'release-15', 'n28', 'event-exposure', 'baseline']
-          }
-        });
-      }
-    }
-
-    if (query.includes('n28') || query.includes('nef') || query.includes('network exposure')) {
-      mockResults.push({
-        content: `N28 Interface Specification:
-
-The N28 interface connects Network Functions to the Network Exposure Function (NEF) in 5G Service Based Architecture:
-
-1. N28 Interface Overview:
-   - Purpose: Enables secure exposure of network capabilities to external applications
-   - Architecture: Service-based interface using HTTP/2 REST APIs
-   - Authentication: OAuth 2.0 and TLS mutual authentication
-   - Data Format: JSON over HTTPS
-
-2. Key N28 Services:
-   - Event monitoring and notification services
-   - Location services (positioning, tracking)
-   - Device triggering and configuration
-   - Quality of Service (QoS) management
-   - Session management exposure
-
-3. N28 Interface Procedures:
-   - Service registration and discovery
-   - Subscription management for events
-   - Real-time event notification delivery
-   - Policy and charging control exposure
-   - Analytics and monitoring data exposure
-
-4. Security Requirements:
-   - Mutual TLS authentication between NF and NEF
-   - OAuth 2.0 token-based authorization
-   - API rate limiting and quota management
-   - Audit logging for all exposed operations
-
-5. Implementation Considerations:
-   - HTTP/2 protocol mandatory for performance
-   - JSON Schema validation for all API operations
-   - Error handling with standardized problem details
-   - Scalability through stateless design`,
-        source_specification: 'TS 23.502',
-        release: 'Rel-15',
-        section: '4.3.6',
-        relevance_score: 0.93,
-        metadata: {
-          specification_id: 'TS 23.502',
-          working_group: 'SA2',
-          document_type: 'Technical Specification',
-          keywords: ['n28', 'nef', 'network-exposure', 'interface', 'external-exposure']
-        }
-      });
-
-      mockResults.push({
-        content: `N28 Event Exposure Implementation:
-
-Detailed implementation guidance for N28 interface event exposure capabilities:
-
-1. Event Subscription Process:
-   - External application authenticates with NEF
-   - NEF validates application credentials and permissions
-   - Application creates event subscription via POST /subscriptions
-   - NEF forwards subscription to relevant Network Function
-   - Subscription confirmation returned with unique subscriptionId
-
-2. Event Notification Flow:
-   - Network Function detects subscribed event occurrence
-   - NF sends notification to NEF via internal interface
-   - NEF processes and enriches notification data
-   - NEF delivers notification to external application via N28
-   - Notification includes notifyID for correlation and tracking
-
-3. N28 API Endpoints:
-   - POST /subscriptions - Create event subscription
-   - GET /subscriptions/{subscriptionId} - Retrieve subscription details
-   - PUT /subscriptions/{subscriptionId} - Modify existing subscription
-   - DELETE /subscriptions/{subscriptionId} - Cancel subscription
-   - POST /events/{subscriptionId}/notify - Receive event notifications
-
-4. Error Handling:
-   - HTTP status codes for operation results
-   - ProblemDetails structure for error information
-   - Retry mechanisms for failed notifications
-   - Fallback procedures for NEF unavailability
-
-5. Performance Requirements:
-   - Sub-second notification delivery for real-time events
-   - Support for high-frequency event streams
-   - Efficient batching for bulk notifications
-   - Rate limiting to prevent system overload`,
-        source_specification: 'TS 29.122',
-        release: 'Rel-15',
-        section: '5.2',
-        relevance_score: 0.91,
-        metadata: {
-          specification_id: 'TS 29.122',
-          working_group: 'SA2',
-          document_type: 'Technical Specification',
-          keywords: ['n28', 'event-exposure', 'implementation', 'api', 'notifications']
-        }
-      });
-    }
-
-    // Apply filters
-    let filteredResults = mockResults;
-
-    if (request.series_filter && request.series_filter.length > 0) {
-      filteredResults = filteredResults.filter(result =>
-        request.series_filter!.some(series =>
-          result.source_specification.startsWith(`TS ${series}`)
-        )
-      );
-    }
-
-    if (request.release_filter && request.release_filter.length > 0) {
-      filteredResults = filteredResults.filter(result =>
-        request.release_filter!.includes(result.release)
-      );
-    }
-
-    // If no results found, add search suggestions
-    if (filteredResults.length === 0) {
-      const suggestions = this.generateSearchSuggestions(query);
-      mockResults.push({
-        content: `No direct results found for query: "${request.query}"
-
-Search Suggestions:
-${suggestions.map((suggestion, index) => `${index + 1}. ${suggestion.suggestion} (Reason: ${suggestion.reason})`).join('\n')}
-
-Tip: Try searching with:
-- Exact specification numbers (e.g., "TS 29.594", "32.290")
-- Key technical terms (e.g., "charging", "authentication", "handover")
-- Interface names (e.g., "N28", "CHF", "NEF")
-- Release-specific queries (e.g., "Release 15", "Rel-16")
-
-Available specification areas:
-- Charging and Billing: TS 32.x series
-- Security: TS 33.x series
-- Radio Access: TS 38.x series
-- System Architecture: TS 23.x series
-- APIs and Interfaces: TS 29.x series`,
-        source_specification: 'Search Guidance',
-        release: 'General',
-        section: 'Search Help',
-        relevance_score: 0.1,
-        metadata: {
-          specification_id: 'SEARCH_SUGGESTIONS',
-          working_group: 'System',
-          document_type: 'Search Guidance',
-          keywords: ['search-help', 'suggestions', 'guidance']
-        }
-      });
-      return mockResults;
-    }
-
-    // Sort by relevance score and limit results
-    return filteredResults
-      .sort((a, b) => b.relevance_score - a.relevance_score)
-      .slice(0, maxResults);
+  private guessWorkingGroup(specId: string): string {
+    if (specId.startsWith('TS 32')) return 'SA5';
+    if (specId.startsWith('TS 33')) return 'SA3';
+    if (specId.startsWith('TS 38') || specId.startsWith('TS 36')) return 'RAN2';
+    return 'SA2';
   }
 
   private generateCacheKey(request: TSpecSearchRequest): string {

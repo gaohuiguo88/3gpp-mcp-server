@@ -65,6 +65,7 @@ class ThreeGPPMCPServer {
 
     const apiConfig: APIConfig = {
       huggingFaceToken: process.env.HUGGINGFACE_TOKEN,
+      tspecDataDir: process.env.TSPEC_DATA_DIR,
       enableCaching: true,
       cacheTimeout: 3600
     };

@@ -12,6 +12,7 @@ export interface APIConfig {
   huggingFaceToken?: string;
   enableCaching?: boolean;
   cacheTimeout?: number;
+  tspecDataDir?: string;
 }
 
 export interface EnhancedSearchRequest {
@@ -43,7 +44,7 @@ export class APIManager {
       ...config
     };
 
-    this.tspecClient = new TSpecLLMClient(config.huggingFaceToken);
+    this.tspecClient = new TSpecLLMClient(config.tspecDataDir, config.huggingFaceToken);
     this.tgppClient = new TGPPApiClient();
   }
 
